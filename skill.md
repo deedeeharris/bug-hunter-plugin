@@ -7,21 +7,38 @@ description: Use when asked to hunt bugs, find and fix bugs, audit code quality,
 
 Scan any repo for bugs across 6 categories, verify with 5-judge majority vote, deduplicate, prove, fix in batches, regression-check, commit, and re-scan until clean.
 
-## CRITICAL RULES
+## CRITICAL RULES — BABYSITTER ENFORCEMENT
 
-**You MUST use babysitter orchestration. This is NON-NEGOTIABLE.**
+**You MUST use babysitter orchestration for the ENTIRE run. This is NON-NEGOTIABLE.**
 
-- Do NOT execute the bug hunt yourself
+- Do NOT execute any bug hunting phase yourself — not scan, not verify, not fix, not commit
 - Do NOT skip babysitter because "it's simpler to just do it"
 - Do NOT rationalize bypassing orchestration for any reason
+- Do NOT execute agent tasks directly after receiving scan results — post them back via task:post and let babysitter dispatch the next phase
 - If babysitter setup fails, fix the setup — do NOT fall back to manual execution
+- After EVERY task:post, STOP the session. The hook will call you back for the next phase.
 
-| Rationalization | Reality |
-|----------------|---------|
-| "I can just scan and fix directly" | The process has 5-judge verification, dedup, regression checks. You will skip them. |
-| "Babysitter is overkill for this" | The user explicitly requires babysitter. Use it. |
-| "Let me just do a quick scan first" | That IS the babysitter process. Launch it. |
-| "The session is too short" | Yolo mode runs autonomously. Launch it. |
+### Short-Circuit Detection
+
+If you find yourself doing ANY of these, you are short-circuiting babysitter. STOP and correct course:
+
+| What you're doing | What you SHOULD do |
+|---|---|
+| Running an Agent to scan AND then running another Agent to verify in the same session | Post scan results via task:post, STOP. Babysitter dispatches verify on next iteration. |
+| Fixing bugs directly after seeing scan results | Post scan results via task:post, STOP. Let babysitter drive dedup -> verify -> prove -> fix pipeline. |
+| Calling run:iterate, performing the task, AND calling run:iterate again in the same session | Perform ONE task, post result, STOP. Hook triggers next iteration. |
+| Deciding "the remaining phases aren't needed" | ALL phases exist for a reason. The 5-judge vote catches false positives. Regression checks catch broken fixes. You cannot skip them. |
+| "I'll just do the fixes quickly since I already have the results" | The process has dedup, 5-judge verify, prove, regression check, and build gates between scan and fix. Skipping them defeats the entire purpose. |
+
+### The Rule: One Task Per Session
+
+```
+Session N:   run:iterate → get pending task → execute task → task:post → STOP
+Session N+1: (hook calls you) → run:iterate → get pending task → execute task → task:post → STOP
+Session N+2: (hook calls you) → run:iterate → ...
+```
+
+You NEVER execute more than one process phase per session. The babysitter journal records every phase transition. If a phase is missing from the journal, the process is broken.
 
 ## Modes
 
@@ -61,16 +78,19 @@ Scan any repo for bugs across 6 categories, verify with 5-judge majority vote, d
 ## Steps
 
 1. Detect the current project's `projectDir`, `buildCmd` (check CLAUDE.md, build.gradle, package.json, etc.)
-2. Parse mode from user args: "interactive" → autoFix=false, otherwise autoFix=true
+2. Parse mode from user args: "interactive" -> autoFix=false, otherwise autoFix=true
 3. Create inputs JSON at `.a5c/processes/bug-hunter-inputs.json`
 4. Invoke `babysitter:yolo` (autoFix=true) or `babysitter:call` (autoFix=false)
-5. Let babysitter drive the entire flow
+5. Let babysitter drive the ENTIRE flow — every phase is a separate babysitter task
 
 ## What the Process Does
 
 ```
-DETECT → SCAN (6 categories) → DEDUP → VERIFY (5-judge vote)
-→ PROVE → [BREAKPOINT if interactive] → FIX (batches of 8, by severity)
-→ REGRESSION CHECK → BUILD → [BREAKPOINT if interactive] → COMMIT (with bug IDs)
-→ RE-SCAN (modified files only) → LOOP until clean or maxIterations → REPORT
+DETECT -> SCAN (6 categories IN PARALLEL) -> DEDUP -> VERIFY (5-judge vote)
+-> PROVE -> [BREAKPOINT if interactive] -> FIX (batches of 8, by severity)
+-> REGRESSION CHECK -> BUILD (hard shell gate) -> [BREAKPOINT if interactive]
+-> COMMIT (with bug IDs) -> RE-SCAN (modified files only)
+-> LOOP until clean or maxIterations -> REPORT
 ```
+
+Each arrow (`->`) is a separate babysitter task. Each task is dispatched by babysitter, executed by you, and posted back via `task:post`. You never skip ahead.
