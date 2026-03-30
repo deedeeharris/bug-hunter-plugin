@@ -1,7 +1,7 @@
 {
   "name": "bug-hunter",
-  "version": "1.1.0",
-  "description": "Generic bug hunter: scan any repo for bugs with parallel scanning, 5-judge majority-vote verification, 2-signal evidence gate, dedup, fix in batches, hard build gates, regression check, commit, re-scan until clean. Enforces full babysitter orchestration for all phases. Installs /bh slash command.",
+  "version": "1.2.0",
+  "description": "Generic bug hunter: parallel scanning, 5-judge verification, 2-signal evidence, fix-confidence scoring with convergence loop, hard build gates, regression check, re-scan until clean. Full babysitter orchestration enforced. Installs /bh slash command.",
   "author": "deedeeharris",
   "tags": ["bugs", "audit", "code-quality", "security", "testing", "babysitter"]
 }

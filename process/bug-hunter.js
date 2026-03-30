@@ -1,14 +1,16 @@
 /**
  * @process generic/bug-hunter
- * @description Generic bug hunter: scan any repo with parallel agents, 5-judge majority-vote verification, dedup, prove, fix (max 8/batch), regression check, hard build gate, commit with bug IDs, re-scan modified files only until done.
- * @inputs { projectDir: string, buildCmd?: string, testCmd?: string, maxIterations?: number, categories?: string[], maxBatchSize?: number, autoFix?: boolean }
- * @outputs { success: boolean, totalFound: number, falsePositives: number, verified: number, fixed: number, remaining: number, iterations: number }
+ * @description Generic bug hunter: scan any repo with parallel agents, 5-judge majority-vote verification, dedup, prove, fix (max 8/batch), fix-confidence scoring with convergence loop, regression check, hard build gate, commit with bug IDs, re-scan modified files only until done.
+ * @inputs { projectDir: string, buildCmd?: string, testCmd?: string, maxIterations?: number, categories?: string[], maxBatchSize?: number, autoFix?: boolean, fixConfidenceTarget?: number, maxFixAttempts?: number }
+ * @outputs { success: boolean, totalFound: number, falsePositives: number, verified: number, fixed: number, remaining: number, iterations: number, fixConfidenceScores: object[] }
  */
 
 import { defineTask } from '@a5c-ai/babysitter-sdk';
 
 const ALL_CATEGORIES = ['logic', 'security', 'memory-lifecycle', 'error-handling', 'performance', 'thread-safety'];
 const DEFAULT_MAX_BATCH = 8;
+const DEFAULT_FIX_CONFIDENCE_TARGET = 85;
+const DEFAULT_MAX_FIX_ATTEMPTS = 3;
 
 // ==========================================================================
 // MAIN PROCESS
@@ -23,6 +25,8 @@ export async function process(inputs, ctx) {
     categories = ALL_CATEGORIES,
     maxBatchSize = DEFAULT_MAX_BATCH,
     autoFix = true,
+    fixConfidenceTarget = DEFAULT_FIX_CONFIDENCE_TARGET,
+    maxFixAttempts = DEFAULT_MAX_FIX_ATTEMPTS,
   } = inputs;
 
   if (!projectDir) throw new Error('projectDir is required');
@@ -33,6 +37,7 @@ export async function process(inputs, ctx) {
 
   let allFixedBugs = [];
   let allFalsePositives = [];
+  let allFixConfidenceScores = [];
   let totalFound = 0;
   let iteration = 0;
   let modifiedFiles = [];
@@ -94,17 +99,68 @@ export async function process(inputs, ctx) {
         await ctx.breakpoint(`About to fix ${batch.bugs.length} ${batch.severity}-severity bugs:\n\n${batchSummary}\n\nProceed?`);
       }
 
-      // Fix
-      const fixResult = await ctx.task(fixBatchTask, { projectDir, bugs: batch.bugs, severity: batch.severity });
+      // --- Fix with confidence scoring convergence loop ---
+      let fixAttempt = 0;
+      let fixResult = null;
+      let confidenceResult = null;
+      let batchConverged = false;
 
-      // Regression check + build gate in parallel
+      while (fixAttempt < maxFixAttempts && !batchConverged) {
+        fixAttempt++;
+
+        // Fix (or re-fix with previous feedback)
+        fixResult = await ctx.task(fixBatchTask, {
+          projectDir,
+          bugs: batch.bugs,
+          severity: batch.severity,
+          attempt: fixAttempt,
+          previousFeedback: confidenceResult?.lowConfidenceFixes || null,
+        });
+
+        // Score fix confidence — did each fix actually address the root cause?
+        confidenceResult = await ctx.task(fixConfidenceScoringTask, {
+          projectDir,
+          bugs: batch.bugs,
+          fixResult,
+          attempt: fixAttempt,
+          targetConfidence: fixConfidenceTarget,
+        });
+
+        allFixConfidenceScores.push({
+          batch: `${batch.severity}-${batches.indexOf(batch)}`,
+          attempt: fixAttempt,
+          overallConfidence: confidenceResult.overallConfidence,
+          perBugScores: confidenceResult.perBugScores,
+        });
+
+        if (confidenceResult.overallConfidence >= fixConfidenceTarget) {
+          batchConverged = true;
+        } else if (fixAttempt < maxFixAttempts) {
+          // Check for plateau — if improvement < 5 points, breakpoint
+          if (fixAttempt >= 2) {
+            const prevScore = allFixConfidenceScores[allFixConfidenceScores.length - 2]?.overallConfidence || 0;
+            const improvement = confidenceResult.overallConfidence - prevScore;
+            if (improvement < 5) {
+              if (!autoFix) {
+                await ctx.breakpoint(
+                  `Fix confidence plateaued at ${confidenceResult.overallConfidence}/${fixConfidenceTarget} ` +
+                  `(+${improvement} from last attempt). Continue refining or accept current fixes?`
+                );
+              }
+              // In yolo mode, accept plateau and move on
+              batchConverged = true;
+            }
+          }
+        }
+      }
+
+      // Regression check + compile gate in parallel
       const [regressionResult, lintResult] = await ctx.parallel.all([
         () => ctx.task(regressionCheckTask, {
           projectDir,
           filesModified: fixResult.filesModified || [],
           bugsFixed: fixResult.bugsFixed || [],
         }),
-        // Hard lint/compile gate — shell task, fails on non-zero exit
         buildCmd ? () => ctx.task(compileGateTask, { projectDir, buildCmd }) : () => Promise.resolve({ success: true }),
       ]);
 
@@ -125,17 +181,20 @@ export async function process(inputs, ctx) {
         await ctx.task(fixBuildErrorsTask, { projectDir, errors: buildResult.errors, buildCmd, testCmd });
         const retryBuild = await ctx.task(buildTestTask, { projectDir, buildCmd, testCmd, batchName: `${batch.severity} fixes (retry)` });
         if (!retryBuild.buildSuccess) {
-          // Hard stop — breakpoint even in yolo mode for build failures
           await ctx.breakpoint(`Build failed after fixing ${batch.severity} bugs. Errors:\n${JSON.stringify(retryBuild.errors, null, 2)}\n\nManual intervention required. Continue anyway?`);
         }
       }
 
       // Breakpoint: Review changes before committing (interactive mode)
       if (!autoFix) {
-        await ctx.breakpoint(`Build passed for ${batch.severity} fixes. Commit these changes?`);
+        await ctx.breakpoint(
+          `Build passed for ${batch.severity} fixes. ` +
+          `Fix confidence: ${confidenceResult.overallConfidence}/${fixConfidenceTarget} (${fixAttempt} attempt${fixAttempt > 1 ? 's' : ''}). ` +
+          `Commit these changes?`
+        );
       }
 
-      // Commit with bug IDs — one commit per bug for atomic rollback
+      // Commit with bug IDs
       const bugIds = (fixResult.bugsFixed || batch.bugs.map(b => b.id));
       await ctx.task(commitBatchTask, { projectDir, severity: batch.severity, fixResult, bugIds });
 
@@ -149,6 +208,10 @@ export async function process(inputs, ctx) {
   }
 
   // --- Final report ---
+  const avgConfidence = allFixConfidenceScores.length > 0
+    ? Math.round(allFixConfidenceScores.reduce((sum, s) => sum + s.overallConfidence, 0) / allFixConfidenceScores.length)
+    : null;
+
   const report = await ctx.task(finalReportTask, {
     projectDir,
     totalFound,
@@ -159,6 +222,9 @@ export async function process(inputs, ctx) {
     iterations: iteration,
     fixedBugs: allFixedBugs,
     falsePositivesList: allFalsePositives,
+    fixConfidenceScores: allFixConfidenceScores,
+    avgFixConfidence: avgConfidence,
+    fixConfidenceTarget,
   });
 
   return {
@@ -169,6 +235,8 @@ export async function process(inputs, ctx) {
     fixed: allFixedBugs.length,
     remaining: (totalFound - allFalsePositives.length) - allFixedBugs.length,
     iterations: iteration,
+    fixConfidenceScores: allFixConfidenceScores,
+    avgFixConfidence: avgConfidence,
   };
 }
 
@@ -426,15 +494,25 @@ export const proveAllBugsTask = defineTask('prove-all-bugs', (args) => ({
 
 export const fixBatchTask = defineTask('fix-batch', (args) => ({
   kind: 'agent',
-  title: `Fix ${args.severity} bugs (${args.bugs.length} issues)`,
+  title: `Fix ${args.severity} bugs (${args.bugs.length} issues)${args.attempt > 1 ? ` — attempt ${args.attempt}` : ''}`,
   agent: {
     name: 'general-purpose',
     prompt: {
       role: 'Senior software engineer fixing verified and proven bugs',
-      task: `Fix all ${args.severity}-severity verified bugs in ${args.projectDir}.`,
+      task: `Fix all ${args.severity}-severity verified bugs in ${args.projectDir}.${args.attempt > 1 ? ` This is attempt ${args.attempt} — previous fixes scored below confidence target.` : ''}`,
       instructions: [
         `Fix ALL ${args.bugs.length} bugs listed below. Read each file FULLY before editing. Make surgical edits — do not rewrite entire files.`,
         '',
+        ...(args.previousFeedback?.length > 0 ? [
+          'PREVIOUS FIX ATTEMPT FEEDBACK (address these issues):',
+          ...args.previousFeedback.map(f =>
+            `  - [${f.bugId}] Confidence: ${f.confidence}/100 — ${f.reason}`
+          ),
+          '',
+          'Focus on the low-confidence fixes above. Re-read the code, re-read the proof,',
+          'and ensure your fix addresses the ACTUAL root cause, not just the symptom.',
+          '',
+        ] : []),
         'BUGS TO FIX:',
         ...args.bugs.map((b, i) =>
           `${i + 1}. [${b.id}] [${b.category}] ${b.file}:${b.line} — ${b.title}\n   ${b.description}\n   Proof: ${b.proof || 'N/A'}`
@@ -449,10 +527,85 @@ export const fixBatchTask = defineTask('fix-batch', (args) => ({
         '',
         'IMPORTANT: You are executing a SINGLE TASK in a babysitter-orchestrated pipeline.',
         'Do ONLY fixing. Do NOT run builds, commit, or take any other action.',
-        'Babysitter will dispatch separate regression check and build tasks after this.',
+        'Babysitter will dispatch separate confidence scoring, regression check, and build tasks after this.',
         '',
         'Return ONLY JSON:',
         '{"filesModified": ["..."], "fixesMade": ["short description per fix"], "bugsFixed": ["bug ids"]}',
+      ],
+      outputFormat: 'JSON',
+    },
+  },
+}));
+
+// Fix confidence scoring — scores whether each fix addresses the proven root cause
+export const fixConfidenceScoringTask = defineTask('fix-confidence-scoring', (args) => ({
+  kind: 'agent',
+  title: `Score fix confidence (attempt ${args.attempt}): ${args.bugs.length} fixes, target ${args.targetConfidence}`,
+  agent: {
+    name: 'general-purpose',
+    prompt: {
+      role: 'Senior QA engineer and code reviewer evaluating fix correctness',
+      task: `Score the confidence that each bug fix actually addresses the proven root cause. Target: ${args.targetConfidence}/100.`,
+      instructions: [
+        `Project: ${args.projectDir}`,
+        `Attempt: ${args.attempt}`,
+        `Target confidence: ${args.targetConfidence}/100`,
+        '',
+        'FOR EACH BUG AND ITS FIX, evaluate across 4 dimensions:',
+        '',
+        '1. ROOT CAUSE MATCH (weight: 40%)',
+        '   Does the fix address the exact root cause described in the proof?',
+        '   Or does it only address a symptom / a different issue?',
+        '   Score 0-100.',
+        '',
+        '2. COMPLETENESS (weight: 25%)',
+        '   Does the fix handle all code paths where the bug manifests?',
+        '   Are there other call sites / similar patterns left unfixed?',
+        '   Score 0-100.',
+        '',
+        '3. CORRECTNESS (weight: 20%)',
+        '   Is the fix itself correct? No new logic errors?',
+        '   Does it preserve existing behavior for non-buggy cases?',
+        '   Score 0-100.',
+        '',
+        '4. SAFETY (weight: 15%)',
+        '   Could the fix break callers or change public API behavior?',
+        '   Does it introduce any new risk?',
+        '   Score 0-100.',
+        '',
+        'BUGS AND THEIR FIXES:',
+        ...args.bugs.map((b, i) => [
+          `Bug ${i + 1}: [${b.id}] ${b.file}:${b.line} — ${b.title}`,
+          `  Description: ${b.description}`,
+          `  Proof: ${b.proof || 'N/A'}`,
+          `  Fix applied: ${(args.fixResult.fixesMade || [])[i] || 'see modified files'}`,
+        ].join('\n')),
+        '',
+        'FILES MODIFIED:',
+        JSON.stringify(args.fixResult.filesModified || []),
+        '',
+        'Read each modified file and the git diff to evaluate the fixes.',
+        '',
+        'IMPORTANT: You are executing a SINGLE TASK in a babysitter-orchestrated pipeline.',
+        'Do ONLY scoring. Do NOT fix bugs or take any other action.',
+        '',
+        'Return ONLY JSON:',
+        '{',
+        '  "overallConfidence": <weighted average 0-100>,',
+        '  "perBugScores": [',
+        '    {',
+        '      "bugId": "...",',
+        '      "confidence": <weighted score 0-100>,',
+        '      "rootCauseMatch": <0-100>,',
+        '      "completeness": <0-100>,',
+        '      "correctness": <0-100>,',
+        '      "safety": <0-100>,',
+        '      "verdict": "high-confidence|medium-confidence|low-confidence|needs-rework",',
+        '      "reason": "brief explanation"',
+        '    }',
+        '  ],',
+        '  "lowConfidenceFixes": [<bugs where confidence < target, with bugId, confidence, reason for feedback to next attempt>]',
+        '}',
       ],
       outputFormat: 'JSON',
     },
@@ -621,12 +774,23 @@ export const finalReportTask = defineTask('final-report', (args) => ({
         'FALSE POSITIVES (discarded):',
         JSON.stringify(args.falsePositivesList?.map(b => ({ id: b.id, title: b.title, file: b.file, votes: b.votes, reason: b.reason })) || []),
         '',
+        args.avgFixConfidence != null ? `Average fix confidence: ${args.avgFixConfidence}/100 (target: ${args.fixConfidenceTarget})` : '',
+        '',
+        'FIX CONFIDENCE SCORES:',
+        JSON.stringify(args.fixConfidenceScores?.map(s => ({
+          batch: s.batch,
+          attempt: s.attempt,
+          confidence: s.overallConfidence,
+          perBug: s.perBugScores?.map(p => ({ bugId: p.bugId, confidence: p.confidence, verdict: p.verdict })),
+        })) || []),
+        '',
         'Write a clean markdown report with:',
-        '1. Summary stats table',
-        '2. Fixed bugs grouped by severity with bug IDs',
-        '3. False positives that were correctly filtered',
-        '4. Any remaining issues',
-        '5. Recommendations',
+        '1. Summary stats table (include avg fix confidence)',
+        '2. Fixed bugs grouped by severity with bug IDs and per-bug confidence scores',
+        '3. Fix confidence convergence history (attempts per batch, score progression)',
+        '4. False positives that were correctly filtered',
+        '5. Any remaining issues',
+        '6. Recommendations (flag any fixes with confidence < 70 as needing manual review)',
         '',
         'Save the report to: ' + args.projectDir + '/BUG-HUNT-REPORT.md',
         '',

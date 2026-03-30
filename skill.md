@@ -74,6 +74,8 @@ You NEVER execute more than one process phase per session. The babysitter journa
 | `maxBatchSize` | 8 | Max bugs per fix batch |
 | `categories` | all 6 | Which bug categories to scan |
 | `autoFix` | true | true=yolo (no breakpoints), false=interactive (breakpoints before fix/commit) |
+| `fixConfidenceTarget` | 85 | Target confidence score (0-100) for fix correctness. See scoring guide below. |
+| `maxFixAttempts` | 3 | Max re-fix attempts per batch if confidence is below target |
 
 ## Steps
 
@@ -87,10 +89,42 @@ You NEVER execute more than one process phase per session. The babysitter journa
 
 ```
 DETECT -> SCAN (6 categories IN PARALLEL) -> DEDUP -> VERIFY (5-judge vote)
--> PROVE -> [BREAKPOINT if interactive] -> FIX (batches of 8, by severity)
--> REGRESSION CHECK -> BUILD (hard shell gate) -> [BREAKPOINT if interactive]
+-> PROVE -> [BREAKPOINT if interactive]
+-> FIX (batches of 8, by severity) -> SCORE FIX CONFIDENCE (4-dimension)
+   -> [if confidence < target: RE-FIX with feedback, up to maxFixAttempts]
+   -> [if plateau detected: accept or breakpoint]
+-> REGRESSION CHECK + COMPILE GATE (parallel)
+-> BUILD+TEST (hard shell gate) -> [BREAKPOINT if interactive]
 -> COMMIT (with bug IDs) -> RE-SCAN (modified files only)
--> LOOP until clean or maxIterations -> REPORT
+-> LOOP until clean or maxIterations -> REPORT (with confidence scores)
 ```
 
 Each arrow (`->`) is a separate babysitter task. Each task is dispatched by babysitter, executed by you, and posted back via `task:post`. You never skip ahead.
+
+## Fix Confidence Scoring
+
+After each fix batch, an agent scores every fix across 4 dimensions:
+
+| Dimension | Weight | What It Measures |
+|-----------|--------|------------------|
+| Root Cause Match | 40% | Does the fix address the exact proven root cause, not just a symptom? |
+| Completeness | 25% | Are all code paths where the bug manifests covered? |
+| Correctness | 20% | Is the fix itself correct? No new logic errors? |
+| Safety | 15% | Could the fix break callers or change public API? |
+
+### When to Use Which Target
+
+| Target | When | Use Case |
+|--------|------|----------|
+| **70** | Quick scans, low-risk internal tools | "Fix the obvious stuff" |
+| **80** | Standard development, most repos | "Good enough for a PR" |
+| **85** | **Default** — production code, typical audits | "Confident the fixes are correct" |
+| **90** | Security-critical, payment systems, compliance | "High assurance" |
+| **95** | Rarely — beware of plateaus and diminishing returns | Only if every fix MUST be perfect |
+
+### Convergence Behavior
+
+- If overall confidence >= target after first attempt: move on (no re-fix needed)
+- If below target: low-confidence fixes are fed back as specific feedback to the next attempt
+- If improvement plateaus (< 5 points between attempts): accept and move on (yolo) or breakpoint (interactive)
+- Max attempts prevents infinite loops (default: 3)
