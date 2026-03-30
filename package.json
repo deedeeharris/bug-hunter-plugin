@@ -1,0 +1,7 @@
+{
+  "name": "bug-hunter",
+  "version": "1.0.0",
+  "description": "Generic bug hunter: scan any repo for bugs with 5-judge majority-vote verification, dedup, fix in batches, regression check, commit, re-scan until clean. Installs /bh slash command.",
+  "author": "deedeeharris",
+  "tags": ["bugs", "audit", "code-quality", "security", "testing"]
+}
